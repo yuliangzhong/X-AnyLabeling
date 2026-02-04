@@ -1,4 +1,5 @@
 import base64
+import os.path as osp
 import cv2
 import json
 import numpy as np
@@ -13,6 +14,7 @@ from PyQt5.QtWidgets import QApplication
 from anylabeling.views.labeling.shape import Shape
 from anylabeling.views.labeling.logger import logger
 from anylabeling.views.labeling.utils.opencv import qt_img_to_rgb_cv_img
+from anylabeling.views.labeling.utils._io import io_open
 from .model import Model
 from .types import AutoLabelingResult
 
@@ -57,6 +59,9 @@ class RemoteServer(Model):
         self.replace = True
         self.reset_tracker_flag = False
 
+        # Reject new masks that overlap existing masks above this IoU
+        self.overlap_iou_threshold = 0.5
+
         self.current_task = None
 
         # Segment Anything 3
@@ -67,6 +72,51 @@ class RemoteServer(Model):
         self.video_prompt_frame = None
         self.video_session_image_list = None
         self.video_prompt_type = None
+
+    def _load_existing_shape_data(self, frame_file, output_dir=None):
+        """Load existing shapes from label JSON for a frame."""
+        try:
+            label_file = osp.splitext(frame_file)[0] + ".json"
+            if output_dir:
+                label_file = osp.join(output_dir, osp.basename(label_file))
+            if not osp.exists(label_file):
+                return []
+            with io_open(label_file, "r") as f:
+                data = json.load(f)
+            return data.get("shapes", [])
+        except Exception as e:
+            logger.warning(f"Failed to load existing labels: {e}")
+            return []
+
+    def _shape_to_mask(self, points, shape_type, img_hw):
+        """Rasterize a shape to a binary mask."""
+
+        if points is None or len(points) == 0:
+            return None
+        if shape_type != "polygon":
+            logger.info(
+                "Only polygon shape type accepted. Given: ", shape_type
+            )
+            return None
+
+        pts = []
+        for p in points:
+            pts.append([p[0], p[1]])
+        pts = np.array(pts, dtype=np.float32)
+        if len(pts) < 3:
+            return None
+
+        mask = np.zeros(img_hw, dtype=np.uint8)
+
+        cv2.fillPoly(mask, [np.round(pts).astype(np.int32)], color=1)
+        return mask.astype(bool)
+
+    def _mask_iou(self, a, b):
+        union = np.logical_or(a, b).sum()
+        if union == 0:
+            return 0.0
+        inter = np.logical_and(a, b).sum()
+        return float(inter) / float(union)
 
     def set_cache_auto_label(self, text, gid):
         """Set cache auto label"""
@@ -755,6 +805,25 @@ class RemoteServer(Model):
                         if not masks:
                             continue
 
+                        # Load existing shapes for IoU filtering
+                        existing_shapes = self._load_existing_shape_data(
+                            frame_file, getattr(widget, "output_dir", None)
+                        )
+                        existing_masks = []
+                        img_hw = None
+                        if existing_shapes and self.overlap_iou_threshold > 0:
+                            frame_img = cv2.imread(frame_file)
+                            if frame_img is not None:
+                                img_hw = frame_img.shape[:2]
+                                for ex in existing_shapes:
+                                    ex_points = ex.get("points", [])
+                                    ex_type = ex.get("shape_type", "polygon")
+                                    ex_mask = self._shape_to_mask(
+                                        ex_points, ex_type, img_hw
+                                    )
+                                    if ex_mask is not None:
+                                        existing_masks.append(ex_mask)
+
                         shapes = []
                         for shape_data in masks:
                             points = shape_data.get("points", [])
@@ -779,6 +848,34 @@ class RemoteServer(Model):
                                     QtCore.QPointF(point[0], point[1])
                                 )
                             if shape.points:
+
+                                # Reject if overlaps existing too much
+                                if (
+                                    existing_masks
+                                    and img_hw is not None
+                                    and self.overlap_iou_threshold > 0
+                                ):
+                                    new_mask = self._shape_to_mask(
+                                        shape.points,
+                                        shape_data.get(
+                                            "shape_type", "polygon"
+                                        ),
+                                        img_hw,
+                                    )
+                                    if new_mask is not None:
+                                        max_iou = max(
+                                            self._mask_iou(new_mask, em)
+                                            for em in existing_masks
+                                        )
+                                        if (
+                                            max_iou
+                                            >= self.overlap_iou_threshold
+                                        ):
+                                            logger.info(
+                                                f"Skipped shape at frame {frame_idx} due to high IoU {max_iou:.2f} with existing annotations"
+                                            )
+                                            continue
+
                                 shapes.append(shape)
 
                         if shapes:
