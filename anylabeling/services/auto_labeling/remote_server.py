@@ -111,7 +111,7 @@ class RemoteServer(Model):
         return mask.astype(bool)
 
     def _mask_overlap_ratio(self, new_mask, existing_mask):
-        if new_mask.sum() == 0:
+        if new_mask is None or existing_mask is None or new_mask.sum() == 0:
             return 0.0
         intersection = np.logical_and(new_mask, existing_mask).sum()
         return float(intersection) / float(new_mask.sum())
@@ -853,10 +853,7 @@ class RemoteServer(Model):
                             if shape.points:
 
                                 # Reject if overlaps existing too much
-                                if (
-                                    existing_mask is not None
-                                    and self.overlap_threshold > 0
-                                ):
+                                if self.overlap_threshold > 0:
                                     new_mask = self._shape_to_mask(
                                         shape.points,
                                         shape_data.get(
@@ -864,20 +861,14 @@ class RemoteServer(Model):
                                         ),
                                         img_hw,
                                     )
-                                    if new_mask is not None:
-                                        overlap_ratio = (
-                                            self._mask_overlap_ratio(
-                                                new_mask, existing_mask
-                                            )
+                                    overlap_ratio = self._mask_overlap_ratio(
+                                        new_mask, existing_mask
+                                    )
+                                    if overlap_ratio >= self.overlap_threshold:
+                                        logger.info(
+                                            f"Skipped shape at frame {frame_idx} due to high overlap {overlap_ratio:.2f} with existing annotations"
                                         )
-                                        if (
-                                            overlap_ratio
-                                            >= self.overlap_threshold
-                                        ):
-                                            logger.info(
-                                                f"Skipped shape at frame {frame_idx} due to high overlap {overlap_ratio:.2f} with existing annotations"
-                                            )
-                                            continue
+                                        continue
 
                                 shapes.append(shape)
 
