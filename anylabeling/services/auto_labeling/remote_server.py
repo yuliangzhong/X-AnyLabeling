@@ -59,8 +59,9 @@ class RemoteServer(Model):
         self.replace = True
         self.reset_tracker_flag = False
 
-        # Reject new masks that overlap existing masks above this IoU
-        self.overlap_iou_threshold = 0.5
+        # Reject new masks that overlap existing masks above this threshold
+        # Metric = Intersection(new mask, existing mask) / new mask area
+        self.overlap_threshold = 0.8
 
         self.current_task = None
 
@@ -91,32 +92,29 @@ class RemoteServer(Model):
     def _shape_to_mask(self, points, shape_type, img_hw):
         """Rasterize a shape to a binary mask."""
 
-        if points is None or len(points) == 0:
+        if points is None or img_hw is None or len(points) < 3:
             return None
         if shape_type != "polygon":
-            logger.info(
-                "Only polygon shape type accepted. Given: ", shape_type
-            )
+            logger.info(f"only polygon is supported, got {shape_type}")
             return None
 
         pts = []
         for p in points:
-            pts.append([p[0], p[1]])
+            if hasattr(p, "x"):
+                pts.append([p.x(), p.y()])
+            else:
+                pts.append([p[0], p[1]])
         pts = np.array(pts, dtype=np.float32)
-        if len(pts) < 3:
-            return None
 
         mask = np.zeros(img_hw, dtype=np.uint8)
-
         cv2.fillPoly(mask, [np.round(pts).astype(np.int32)], color=1)
         return mask.astype(bool)
 
-    def _mask_iou(self, a, b):
-        union = np.logical_or(a, b).sum()
-        if union == 0:
+    def _mask_overlap_ratio(self, new_mask, existing_mask):
+        if new_mask.sum() == 0:
             return 0.0
-        inter = np.logical_and(a, b).sum()
-        return float(inter) / float(union)
+        intersection = np.logical_and(new_mask, existing_mask).sum()
+        return float(intersection) / float(new_mask.sum())
 
     def set_cache_auto_label(self, text, gid):
         """Set cache auto label"""
@@ -805,24 +803,29 @@ class RemoteServer(Model):
                         if not masks:
                             continue
 
-                        # Load existing shapes for IoU filtering
+                        # Load existing shapes in one mask for overlap filtering
                         existing_shapes = self._load_existing_shape_data(
                             frame_file, getattr(widget, "output_dir", None)
                         )
-                        existing_masks = []
+                        existing_mask = None
                         img_hw = None
-                        if existing_shapes and self.overlap_iou_threshold > 0:
-                            frame_img = cv2.imread(frame_file)
-                            if frame_img is not None:
-                                img_hw = frame_img.shape[:2]
-                                for ex in existing_shapes:
-                                    ex_points = ex.get("points", [])
-                                    ex_type = ex.get("shape_type", "polygon")
-                                    ex_mask = self._shape_to_mask(
-                                        ex_points, ex_type, img_hw
-                                    )
-                                    if ex_mask is not None:
-                                        existing_masks.append(ex_mask)
+                        frame_img = cv2.imread(frame_file)
+                        if frame_img is not None:
+                            img_hw = frame_img.shape[:2]
+                        if existing_shapes and self.overlap_threshold > 0:
+                            for ex in existing_shapes:
+                                ex_points = ex.get("points", [])
+                                ex_type = ex.get("shape_type", "polygon")
+                                ex_mask = self._shape_to_mask(
+                                    ex_points, ex_type, img_hw
+                                )
+                                if ex_mask is not None:
+                                    if existing_mask is None:
+                                        existing_mask = ex_mask
+                                    else:
+                                        existing_mask = np.logical_or(
+                                            existing_mask, ex_mask
+                                        )
 
                         shapes = []
                         for shape_data in masks:
@@ -851,9 +854,8 @@ class RemoteServer(Model):
 
                                 # Reject if overlaps existing too much
                                 if (
-                                    existing_masks
-                                    and img_hw is not None
-                                    and self.overlap_iou_threshold > 0
+                                    existing_mask is not None
+                                    and self.overlap_threshold > 0
                                 ):
                                     new_mask = self._shape_to_mask(
                                         shape.points,
@@ -863,16 +865,17 @@ class RemoteServer(Model):
                                         img_hw,
                                     )
                                     if new_mask is not None:
-                                        max_iou = max(
-                                            self._mask_iou(new_mask, em)
-                                            for em in existing_masks
+                                        overlap_ratio = (
+                                            self._mask_overlap_ratio(
+                                                new_mask, existing_mask
+                                            )
                                         )
                                         if (
-                                            max_iou
-                                            >= self.overlap_iou_threshold
+                                            overlap_ratio
+                                            >= self.overlap_threshold
                                         ):
                                             logger.info(
-                                                f"Skipped shape at frame {frame_idx} due to high IoU {max_iou:.2f} with existing annotations"
+                                                f"Skipped shape at frame {frame_idx} due to high overlap {overlap_ratio:.2f} with existing annotations"
                                             )
                                             continue
 
